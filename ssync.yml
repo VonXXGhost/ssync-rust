@@ -1,0 +1,8 @@
+from:
+  path: .
+  exclude:
+    - .*log
+to:
+  path: ../test/
+
+recursive: true
