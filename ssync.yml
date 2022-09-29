@@ -1,8 +1,11 @@
 from:
-  path: .
+  path: data/test_src
   exclude:
-    - .*log
+    - .*\.test
+    - .*\\文件夹3
 to:
-  path: ../test/
+  path: D:\Project\rust\ssync\data\test_dest
+  exclude:
+    - .*\.test
 
 recursive: true
