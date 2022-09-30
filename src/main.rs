@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use clap::Parser;
 use config::{Config, Value};
+use filetime::FileTime;
 use regex::Regex;
 
 fn main() -> Result<()> {
@@ -37,6 +38,9 @@ fn main() -> Result<()> {
 
     check_continue("继续执行文件操作？");
 
+    DecisionExecuteTask::new(decision_result).execute();
+
+    ready_to_exit();
     Ok(())
 }
 
@@ -74,7 +78,7 @@ struct FileInfo {
     name: String,
     /// 顶层目录路径
     root: String,
-    /// 绝对路径（不含文件名）
+    /// 绝对路径（不含本文件/目录名）
     absolute_dir: String,
 }
 
@@ -87,28 +91,32 @@ impl FileInfo {
         }
     }
 
-    fn absolute_dir_with_file(&self) -> String {
+    fn absolute_dir_with_self(&self) -> String {
         String::from(
             Path::new(&self.absolute_dir).join(&self.name).as_path().to_str().unwrap()
         )
     }
 
     fn file(&self) -> File {
-        File::open(self.absolute_dir_with_file()).unwrap()
+        File::open(self.absolute_dir_with_self()).unwrap()
     }
 
     fn relative_path(&self) -> String {
         String::from(
-            pathdiff::diff_paths(self.absolute_dir_with_file(), &self.root).unwrap()
+            pathdiff::diff_paths(self.absolute_dir_with_self(), &self.root).unwrap()
                 .as_path().to_str().unwrap()
         )
     }
 
     fn relative_path_without_file(&self) -> String {
         String::from(
-            pathdiff::diff_paths(self.absolute_dir_with_file(), &self.root).unwrap()
+            pathdiff::diff_paths(self.absolute_dir_with_self(), &self.root).unwrap()
                 .as_path().parent().unwrap().to_str().unwrap()
         )
+    }
+
+    fn to_path(&self) -> PathBuf {
+        Path::new(&self.absolute_dir_with_self()).to_path_buf()
     }
 }
 
@@ -509,47 +517,94 @@ struct DecisionExecuteTask {
 }
 
 impl DecisionExecuteTask {
-
     pub fn new(decision: DecisionResult) -> Self {
+        let total_count = decision.total_count();
         Self {
             decision,
-            _total_count: decision.total_count(),
+            _total_count: total_count,
             _processed_count: AtomicUsize::new(0),
         }
     }
 
-    fn log_progress(&mut self, item: &DecisionResultItem) {
+    pub fn execute(self) {
+        println!("同步任务开始执行");
+        self.execute_add_task();
+        self.execute_update_task();
+        self.execute_del_task();
+        println!("同步任务执行完毕");
+    }
+
+    fn log_progress(&self, counter: &AtomicUsize, item: &DecisionResultItem) {
         match item.action {
             FileAction::ADD => {
-                let prefix = self.count_and_progress_prefix();
+                let prefix = self.count_and_progress_prefix(counter);
                 println!("{}  Copying - {} to {}", prefix,
-                         item.src_file_info.unwrap().absolute_dir_with_file(),
-                         item.dest_file_info.absolute_dir_with_file()
+                         adjust_canonicalization(item.src_file_info.as_ref().unwrap()
+                             .absolute_dir_with_self()),
+                         adjust_canonicalization(item.dest_file_info.absolute_dir_with_self())
                 );
-            },
+            }
             FileAction::DEL => {
-                let prefix = self.count_and_progress_prefix();
+                let prefix = self.count_and_progress_prefix(counter);
                 println!("{}  Deleting - {}", prefix,
-                         item.dest_file_info.absolute_dir_with_file()
+                         adjust_canonicalization(item.dest_file_info.absolute_dir_with_self())
                 );
-            },
+            }
             FileAction::UPDATE => {
-                let prefix = self.count_and_progress_prefix();
+                let prefix = self.count_and_progress_prefix(counter);
                 println!("{}  Updating - {} to {}", prefix,
-                         item.src_file_info.unwrap().absolute_dir_with_file(),
-                         item.dest_file_info.absolute_dir_with_file()
+                         adjust_canonicalization(item.src_file_info.as_ref().unwrap()
+                             .absolute_dir_with_self()),
+                         adjust_canonicalization(item.dest_file_info.absolute_dir_with_self())
                 );
             }
         }
     }
 
-    fn count_and_progress_prefix(&mut self) -> String {
-        let cnt = self._processed_count.fetch_add(1, Ordering::Relaxed);
+    fn count_and_progress_prefix(&self, counter: &AtomicUsize) -> String {
+        let cnt = counter.fetch_add(1, Ordering::Relaxed);
         return format!("{}/{}", cnt, self._total_count);
     }
 
+    fn execute_add_task(&self) {
+        for (_, items) in &self.decision.add_items {
+            for it in items {
+                self.log_progress(&self._processed_count, it);
+                copy_recursively(
+                    Path::new(&it.src_file_info.as_ref().unwrap().absolute_dir_with_self()),
+                    Path::new(&it.dest_file_info.absolute_dir_with_self()),
+                    false
+                ).unwrap();
+            }
+        }
+    }
 
+    fn execute_del_task(&self) {
+        for (_, items) in &self.decision.del_items {
+            for it in items {
+                self.log_progress(&self._processed_count, it);
+                let path = it.dest_file_info.to_path();
+                if path.is_dir() {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                }.unwrap();
+            }
+        }
+    }
 
+    fn execute_update_task(&self) {
+        for (_, items) in &self.decision.update_items {
+            for it in items {
+                self.log_progress(&self._processed_count, it);
+                copy_recursively(
+                    Path::new(&it.src_file_info.as_ref().unwrap().absolute_dir_with_self()),
+                    Path::new(&it.dest_file_info.absolute_dir_with_self()),
+                    true
+                ).unwrap();
+            }
+        }
+    }
 }
 
 // Function
@@ -652,5 +707,64 @@ fn check_continue(hint: &str) {
     stdin.lock().read_line(&mut line).unwrap();
     if !line.to_uppercase().contains("Y") {
         exit(0);
+    }
+}
+
+/// 预备结束
+fn ready_to_exit() {
+    println!("按下回车键结束……");
+    let mut buf = [0];
+    let stdin = io::stdin();
+    stdin.lock().read(&mut buf).unwrap();
+    exit(0);
+}
+
+fn copy_recursively(src: impl AsRef<Path>, dst: impl AsRef<Path>, overwrite: bool) -> Result<()> {
+    if src.as_ref().is_file() {
+        if dst.as_ref().exists() && overwrite {
+            fs::remove_file(&dst)?;
+            fs::copy(&src, &dst)?;
+            copy_time(&src, &dst)?;
+        } else if !dst.as_ref().exists() {
+            fs::copy(&src, &dst)?;
+            // 复制时间
+            copy_time(&src, &dst)?;
+        }
+    } else {
+        if !dst.as_ref().exists() {
+            fs::create_dir(&dst)?;
+            // 文件夹的试过了修改不了时间
+        }
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            } else {
+                copy_recursively(entry.path(), dst.as_ref().join(entry.file_name()), overwrite)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_time(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
+    let metadata = fs::metadata(src.as_ref()).unwrap();
+    filetime::set_file_times(
+        dst.as_ref(),
+        FileTime::from_last_access_time(&metadata),
+        FileTime::from_last_modification_time(&metadata),
+    )?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn adjust_canonicalization(p: String) -> String {
+    const VERBATIM_PREFIX: &str = r#"\\?\"#;
+    if p.starts_with(VERBATIM_PREFIX) {
+        p[VERBATIM_PREFIX.len()..].to_string()
+    } else {
+        p
     }
 }
